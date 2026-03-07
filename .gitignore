@@ -8,3 +8,18 @@ captures/
 frames/
 texts/
 *.log
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Application outputs
+*.mp4
+*.xlsx
+dist.zip
+
+# Editor settings
+.vscode/
+.cursor/
+.idea/
