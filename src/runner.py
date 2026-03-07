@@ -7,6 +7,8 @@ import threading
 import time
 from datetime import datetime
 
+import openpyxl
+
 from . import capture
 from . import ocr
 from . import video_writer
@@ -193,6 +195,7 @@ def run_detection(
     window_title: str,
     fps: float,
     *,
+    output_path: str = "detections.xlsx",
     stop_event: threading.Event | None = None,
 ) -> None:
     """
@@ -250,6 +253,21 @@ def run_detection(
                     print(log_line.strip())
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(log_line)
+                    
+                    excel_path = output_path
+                    try:
+                        if os.path.exists(excel_path):
+                            wb = openpyxl.load_workbook(excel_path)
+                            ws = wb.active
+                        else:
+                            wb = openpyxl.Workbook()
+                            ws = wb.active
+                            ws.append(["Timestamp", "Multiplier"])
+                        ws.append([timestamp, multiplier])
+                        wb.save(excel_path)
+                    except Exception as e:
+                        print(f"Failed to save to Excel: {e}")
+
                     last_detected = multiplier
             else:
                 empty_frames_count += 1

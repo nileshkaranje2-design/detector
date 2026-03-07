@@ -149,11 +149,13 @@ class CaptureApp:
 
     def _on_detect_mode_change(self):
         if self.detect_mode_var.get():
-            self.output_entry.config(state=tk.DISABLED)
-            self.browse_btn.config(state=tk.DISABLED)
+            self.output_label.config(text="Excel Output")
+            if self.output_var.get() == "output.mp4":
+                self.output_var.set("detections.xlsx")
         else:
-            self.output_entry.config(state=tk.NORMAL)
-            self.browse_btn.config(state=tk.NORMAL)
+            self.output_label.config(text="Video Output:")
+            if self.output_var.get() == "detections.xlsx":
+                self.output_var.set("output.mp4")
 
     def _refresh_windows(self):
         titles = [t[0] for t in capture.list_windows() if t[0].strip()]
@@ -175,17 +177,21 @@ class CaptureApp:
             self.region_label.config(text=f"x={r[0]}, y={r[1]}, {r[2]}x{r[3]}")
 
     def _on_browse(self):
+        is_detect = self.detect_mode_var.get()
+        ext = ".xlsx" if is_detect else ".mp4"
+        ftypes = [("Excel files", "*.xlsx"), ("All files", "*.*")] if is_detect else [("MP4 video", "*.mp4"), ("All files", "*.*")]
         path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4 video", "*.mp4")],
+            defaultextension=ext,
+            filetypes=ftypes,
         )
         if path:
             self.output_var.set(path)
 
     def _run_capture(self):
         fps = float(self.fps_var.get() or "15")
-        output = self.output_var.get().strip() or "output.mp4"
         detect_mode = self.detect_mode_var.get()
+        default_out = "detections.xlsx" if detect_mode else "output.mp4"
+        output = self.output_var.get().strip() or default_out
         
         if self.source_var.get() == "region":
             if not self.region:
@@ -207,6 +213,7 @@ class CaptureApp:
             if detect_mode:
                 runner.run_detection(
                     (self.window_var.get() or "").strip(), fps,
+                    output_path=output,
                     stop_event=self.stop_event
                 )
             else:
