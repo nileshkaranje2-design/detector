@@ -14,6 +14,17 @@ import os
 
 import openai
 
+from . import config
+
+# The key can come from an existing OPENAI_API_KEY env var (e.g. set by the
+# shell), but the primary path is the GUI's "Set API Key" dialog, which
+# persists it via src.config so it's remembered across runs without needing
+# .env.
+if not os.environ.get("OPENAI_API_KEY"):
+    _persisted_key = config.load_api_key()
+    if _persisted_key:
+        os.environ["OPENAI_API_KEY"] = _persisted_key
+
 DEFAULT_MODEL = "gpt-5"
 
 # Offered in the GUI's model dropdown; the box is editable so any other
@@ -64,6 +75,23 @@ def _get_client() -> openai.OpenAI:
     return _client
 
 
+def has_api_key() -> bool:
+    return bool(os.environ.get("OPENAI_API_KEY"))
+
+
+def set_api_key(key: str) -> None:
+    """Set the API key from the GUI, persist it, and drop any cached client
+    so the next prediction call picks up the new key."""
+    global _client
+    key = (key or "").strip()
+    if key:
+        os.environ["OPENAI_API_KEY"] = key
+    else:
+        os.environ.pop("OPENAI_API_KEY", None)
+    config.save_api_key(key)
+    _client = None
+
+
 def predict_next(
     history: list[float],
     timestamps: list[str] | None = None,
@@ -87,7 +115,7 @@ def predict_next(
     prediction errors must never block the capture loop.
     """
     if not os.environ.get("OPENAI_API_KEY"):
-        print("Predictor: OPENAI_API_KEY not set in .env, skipping prediction.")
+        print("Predictor: OPENAI_API_KEY not set - set it via the GUI's 'Set API Key' button, skipping prediction.")
         return None
     if not history:
         return None

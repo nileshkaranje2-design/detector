@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -103,6 +104,12 @@ class CaptureApp:
             f_model, textvariable=self.model_var, values=predictor.MODEL_OPTIONS, width=20
         )
         self.model_combo.pack(side=tk.LEFT)
+        ttk.Button(
+            f_model, text="Set API Key", command=self._on_set_api_key
+        ).pack(side=tk.LEFT, padx=(12, 4))
+        self.api_key_status_var = tk.StringVar()
+        ttk.Label(f_model, textvariable=self.api_key_status_var).pack(side=tk.LEFT)
+        self._update_api_key_status()
 
         # Prediction prompt (editable)
         f_prompt = ttk.Frame(self.root, padding=8)
@@ -122,6 +129,51 @@ class CaptureApp:
     def _on_reset_prompt(self):
         self.prompt_text.delete("1.0", tk.END)
         self.prompt_text.insert("1.0", predictor.DEFAULT_SYSTEM_PROMPT)
+
+    def _update_api_key_status(self):
+        self.api_key_status_var.set("API key: set" if predictor.has_api_key() else "API key: not set")
+
+    def _on_set_api_key(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Set OpenAI API Key")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="OpenAI API key:").pack(anchor=tk.W)
+        key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
+        entry = ttk.Entry(frame, textvariable=key_var, width=50, show="*")
+        entry.pack(fill=tk.X, pady=(4, 4))
+        entry.focus_set()
+
+        show_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame, text="Show key", variable=show_var,
+            command=lambda: entry.config(show="" if show_var.get() else "*"),
+        ).pack(anchor=tk.W)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+
+        def _save():
+            predictor.set_api_key(key_var.get())
+            self._update_api_key_status()
+            dialog.destroy()
+
+        def _clear():
+            predictor.set_api_key("")
+            self._update_api_key_status()
+            dialog.destroy()
+
+        ttk.Button(btn_row, text="Save", command=_save).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_row, text="Clear", command=_clear).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_row, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT)
+
+        dialog.bind("<Return>", lambda _e: _save())
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
     def _on_detect_mode_change(self):
         if self.detect_mode_var.get():
