@@ -6,12 +6,36 @@ import os
 import threading
 import time
 from datetime import datetime
-
-import openpyxl
+from typing import Callable
 
 from . import capture
 from . import ocr
+from . import predictor
 from . import video_writer
+
+
+def _parse_multiplier(value: str) -> float | None:
+    """Parse a multiplier string like '3.02x' into a float."""
+    try:
+        return float(value.rstrip("xX"))
+    except ValueError:
+        return None
+
+
+def _log_prediction_result(path: str, timestamp: str, prediction: dict, actual: float) -> None:
+    """Append a line comparing a previously-made prediction to the actual outcome."""
+    predicted = prediction.get("predicted_multiplier")
+    confidence = prediction.get("confidence")
+    error = abs(predicted - actual) if isinstance(predicted, (int, float)) else None
+    line = (
+        f"{timestamp}\tpredicted={predicted}x\tconfidence={confidence}\t"
+        f"actual={actual}x\terror={error}\n"
+    )
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"Failed to save prediction result to {path}: {e}")
 
 
 def run(
@@ -195,18 +219,83 @@ def run_detection(
     window_title: str,
     fps: float,
     *,
-    output_path: str = "detections.xlsx",
+    output_path: str = "detections.txt",
+    predictions_path: str = "predictions.txt",
     stop_event: threading.Event | None = None,
+    on_update: "Callable[[dict], None] | None" = None,
+    on_frame: "Callable[[object], None] | None" = None,
+    system_prompt: str | None = None,
+    model: str | None = None,
 ) -> None:
     """
     Run continuous detection from a window (by title substring) at target FPS.
-    Applies OCR to detect the multiplier below 'FLEW AWAY!' and logs it to a file.
+    Applies OCR to detect the multiplier below 'FLEW AWAY!' and logs it to a text file.
+    After each detection, asks the predictor to estimate the next round's multiplier and
+    logs predicted-vs-actual to predictions_path once the next round lands.
     Does NOT save video or frames.
+
+    system_prompt, if given, overrides the predictor's default system prompt
+    (e.g. edited by the user in the GUI's prompt box).
+    model, if given, overrides the predictor's default model
+    (e.g. chosen by the user in the GUI's model dropdown).
+
+    If on_update is given, it's called after each new detection with a dict:
+    {"timestamp": <ISO str>, "detected": <float>,
+     "predicted_multiplier": <float | None>, "confidence": <str | None>,
+     "reasoning": <str | None>}. reasoning/predicted_multiplier/confidence are
+    None on the immediate "detected" call and filled in once the background
+    prediction finishes (see _predict_async).
+
+    If on_frame is given, it's called with the raw captured PIL Image every
+    cycle (before OCR), regardless of whether a multiplier was detected.
     """
     frame_interval = 1.0 / fps
-    log_path = "detections.log"
     last_detected = None
-    
+    history: list[float] = []
+    history_timestamps: list[str] = []
+    pending_prediction: dict | None = None
+    # predict_next() is a live, synchronous LLM API call that can take several
+    # seconds. It's run on a background thread (below) so it never stalls the
+    # capture loop; this lock just protects pending_prediction and
+    # prediction_request_id, which both that thread and the loop below read/write.
+    prediction_lock = threading.Lock()
+    # Bumped every time a new round's prediction is requested. If a round's
+    # multiplier lands while an older prediction request is still pending, the
+    # old request is left running (the API call can't be aborted mid-flight)
+    # but its result is treated as cancelled: it's discarded on arrival so only
+    # the newest round's prediction is ever shown/logged.
+    prediction_request_id = 0
+
+    def _predict_async(
+        history_snapshot: list[float],
+        timestamps_snapshot: list[str],
+        timestamp: str,
+        actual_value: float,
+        request_id: int,
+    ) -> None:
+        nonlocal pending_prediction
+        prediction = predictor.predict_next(
+            history_snapshot, timestamps=timestamps_snapshot, system_prompt=system_prompt, model=model
+        )
+        with prediction_lock:
+            if request_id != prediction_request_id:
+                print(f"Prediction for {timestamp} superseded by a newer round; discarding.")
+                return
+            pending_prediction = prediction
+        if prediction is not None:
+            print(
+                f"Predicted next multiplier: {prediction.get('predicted_multiplier')}x "
+                f"(confidence: {prediction.get('confidence')})"
+            )
+        if on_update:
+            on_update({
+                "timestamp": timestamp,
+                "detected": actual_value,
+                "predicted_multiplier": (prediction or {}).get("predicted_multiplier"),
+                "confidence": (prediction or {}).get("confidence"),
+                "reasoning": (prediction or {}).get("reasoning"),
+            })
+
     # We maintain a small memory so we don't log the same 'FLEW AWAY' multiple times for the same round
     # We clear it if we go a few frames without seeing any multiplier.
     empty_frames_count = 0
@@ -240,10 +329,12 @@ def run_detection(
             img = capture.capture_true_window(window)
             if img is None:
                 continue
-                
-            # Perform OCR on the image
-            text = ocr.image_to_text(img)
-            multiplier = ocr.detect_multiplier(text)
+
+            if on_frame:
+                on_frame(img)
+
+            # Locate and OCR just the multiplier text below "FLEW AWAY!"
+            multiplier = ocr.detect_multiplier(img)
             
             if multiplier:
                 empty_frames_count = 0
@@ -251,22 +342,46 @@ def run_detection(
                     timestamp = datetime.now().isoformat()
                     log_line = f"{timestamp} - Detected Multiplier: {multiplier}\n"
                     print(log_line.strip())
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(log_line)
-                    
-                    excel_path = output_path
                     try:
-                        if os.path.exists(excel_path):
-                            wb = openpyxl.load_workbook(excel_path)
-                            ws = wb.active
-                        else:
-                            wb = openpyxl.Workbook()
-                            ws = wb.active
-                            ws.append(["Timestamp", "Multiplier"])
-                        ws.append([timestamp, multiplier])
-                        wb.save(excel_path)
+                        with open(output_path, "a", encoding="utf-8") as f:
+                            f.write(log_line)
                     except Exception as e:
-                        print(f"Failed to save to Excel: {e}")
+                        print(f"Failed to save to {output_path}: {e}")
+
+                    actual_value = _parse_multiplier(multiplier)
+                    if actual_value is not None:
+                        with prediction_lock:
+                            prediction_to_log = pending_prediction
+                            pending_prediction = None
+                        if prediction_to_log is not None:
+                            _log_prediction_result(predictions_path, timestamp, prediction_to_log, actual_value)
+                        history.append(actual_value)
+                        history_timestamps.append(timestamp)
+
+                        # Fire the detection update immediately, before kicking
+                        # off the (slow, network-bound) prediction - the GUI's
+                        # "Last detected" label shouldn't wait on that just
+                        # because it shares an update dict with "Next prediction".
+                        if on_update:
+                            on_update({
+                                "timestamp": timestamp,
+                                "detected": actual_value,
+                                "predicted_multiplier": None,
+                                "confidence": None,
+                            })
+
+                        # Run the prediction on a background thread so a slow
+                        # (or hung) API call never stalls frame capture/OCR.
+                        # Allocate a new request id so any still-pending older
+                        # request gets discarded as cancelled when it returns.
+                        with prediction_lock:
+                            prediction_request_id += 1
+                            request_id = prediction_request_id
+                        threading.Thread(
+                            target=_predict_async,
+                            args=(list(history), list(history_timestamps), timestamp, actual_value, request_id),
+                            daemon=True,
+                        ).start()
 
                     last_detected = multiplier
             else:
