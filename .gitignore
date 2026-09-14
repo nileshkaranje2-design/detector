@@ -17,9 +17,15 @@ dist/
 # Application outputs
 *.mp4
 *.xlsx
+detections.txt
+predictions.txt
 dist.zip
 
 # Editor settings
 .vscode/
 .cursor/
 .idea/
+
+# direnv / project-local Claude account
+.envrc.local
+.claude-config/
