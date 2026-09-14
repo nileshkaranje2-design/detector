@@ -4,25 +4,84 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import sys
+from pathlib import Path
+
 import dotenv
 import numpy as np
 from PIL import Image
 import pytesseract
 
-dotenv.load_dotenv()
-tesseract_cmd = os.environ.get("TESSERACT_CMD", "").strip()
-if tesseract_cmd:
-    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+# Checked when TESSERACT_CMD isn't set and tesseract isn't on PATH, so a
+# packaged build works against a stock Tesseract install without the user
+# having to write a config file first.
+_TESSERACT_FALLBACKS = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    "/usr/local/bin/tesseract",
+    "/opt/homebrew/bin/tesseract",
+)
+
+
+def _load_env() -> None:
+    """
+    Read .env. Under PyInstaller this module lives in a temporary extraction
+    directory, so dotenv's usual search upward from __file__ finds nothing -
+    look beside the executable instead, which is where a packaged build's .env
+    sits.
+    """
+    if getattr(sys, "frozen", False):
+        beside_exe = Path(sys.executable).with_name(".env")
+        if beside_exe.is_file():
+            dotenv.load_dotenv(beside_exe)
+            return
+    dotenv.load_dotenv()
+
+
+def _resolve_tesseract() -> None:
+    """Point pytesseract at a tesseract binary, if one can be found."""
+    configured = os.environ.get("TESSERACT_CMD", "").strip()
+    if configured:
+        pytesseract.pytesseract.tesseract_cmd = configured
+        return
+    if shutil.which("tesseract"):
+        return  # on PATH - pytesseract's default already works
+    for candidate in _TESSERACT_FALLBACKS:
+        if os.path.isfile(candidate):
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            return
+
+
+_load_env()
+_resolve_tesseract()
 
 _MULTIPLIER_RE = re.compile(r'(\d+\.\d+)\s*x?', re.IGNORECASE)
 # Running full-layout OCR (image_to_data) on the full-resolution captured
 # frame takes ~900ms on a retina-size window - far too slow for a real-time
-# loop. Searching a downscaled copy for "FLEW AWAY" first cuts that to
-# ~150ms while still reading the (much larger) banner text reliably; the
-# found box is then scaled back up to locate the crop on the full-res image,
-# which is still used for the actual multiplier digits so read accuracy for
-# the small text isn't affected.
-_SEARCH_SCALE = 0.25
+# loop. Searching a downscaled copy for "FLEW AWAY" first cuts that down a
+# lot; the found box is then scaled back up to locate the crop on the full-res
+# image, which is still used for the actual multiplier digits so read accuracy
+# for the small text isn't affected.
+#
+# The downscale has to be chosen against the *window size*, not fixed. The
+# banner has to survive it: Tesseract needs roughly 10px of glyph height, and
+# the banner is only ~28-40px tall at full resolution (and animates in, so it
+# spends part of each round smaller still). A hardcoded 0.25 put a 28px banner
+# at 7px - unreadable at every window size tested - so rounds were silently
+# missed unless the banner happened to be caught at its largest, which is what
+# made detection look intermittent. Scaling to a target width keeps the banner
+# legible on any window while still avoiding full-resolution OCR on the common
+# case (no banner on screen at all).
+_SEARCH_TARGET_WIDTH = 1200
+_SEARCH_MIN_SCALE = 0.25
+
+
+def _search_scale(width: int) -> float:
+    """Downscale factor for the coarse 'FLEW AWAY' pass on a `width`px frame."""
+    if width <= _SEARCH_TARGET_WIDTH:
+        return 1.0
+    return max(_SEARCH_MIN_SCALE, _SEARCH_TARGET_WIDTH / width)
 _TESSERACT_NOT_FOUND_MSG = (
     "Tesseract OCR is not installed or not on your PATH.\n"
     "  - Install from: https://github.com/UB-Mannheim/tesseract/wiki\n"
@@ -95,8 +154,9 @@ def detect_multiplier(image: Image.Image) -> str | None:
     drawn in red on a dark background, and converting to grayscale collapses
     that contrast (red has low luminance), making the text harder to read.
     """
+    search_scale = _search_scale(image.width)
     search_image = image.resize(
-        (max(1, int(image.width * _SEARCH_SCALE)), max(1, int(image.height * _SEARCH_SCALE)))
+        (max(1, int(image.width * search_scale)), max(1, int(image.height * search_scale)))
     )
     try:
         coarse_data = pytesseract.image_to_data(search_image, output_type=pytesseract.Output.DICT)
@@ -114,7 +174,7 @@ def detect_multiplier(image: Image.Image) -> str | None:
     # resolution, but only on a small, generously padded crop around that
     # approximate area, to get a precise box without paying for full-frame
     # full-resolution OCR.
-    inv_scale = 1.0 / _SEARCH_SCALE
+    inv_scale = 1.0 / search_scale
     approx_left, approx_top, approx_right, approx_bottom = (int(v * inv_scale) for v in coarse_box)
     approx_height = approx_bottom - approx_top
     locate_pad = max(120, approx_height * 3)

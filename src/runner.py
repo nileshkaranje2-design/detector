@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -13,6 +14,27 @@ from . import ocr
 from . import predictor
 from . import video_writer
 
+# How long the multiplier must be absent from the screen before the next
+# sighting counts as a new round rather than a repeat of the current one.
+ROUND_RESET_SEC = 3.0
+
+
+# Date and time each round is written with, e.g. "2026-09-14 11:05:00".
+# Readable in the log rather than ISO-with-microseconds, and still accepted by
+# datetime.fromisoformat() so the GUI can parse it back.
+DETECTION_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Matches the lines written below, e.g.
+#   2026-09-14 11:05:00 - Detected Multiplier: 1.86x
+# The separator is [T ] and the fractional part optional so that logs written
+# before the switch to DETECTION_TIME_FORMAT (ISO, "2026-09-14T11:05:00.324034")
+# still load - these files are appended to across many sessions.
+_DETECTION_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*-\s*"
+    r"Detected Multiplier:\s*(?P<value>\d+(?:\.\d+)?)\s*x?\s*$",
+    re.IGNORECASE,
+)
+
 
 def _parse_multiplier(value: str) -> float | None:
     """Parse a multiplier string like '3.02x' into a float."""
@@ -20,6 +42,28 @@ def _parse_multiplier(value: str) -> float | None:
         return float(value.rstrip("xX"))
     except ValueError:
         return None
+
+
+def load_detections(path: str) -> list[tuple[str, float]]:
+    """
+    Read a detections file written by run_detection() back into
+    (timestamp, multiplier) pairs, oldest first.
+
+    Unparseable lines are skipped rather than raising: these files are appended
+    to across many runs and may hold blank lines or notes, and a single bad
+    line shouldn't cost the user the rest of their history.
+    """
+    rows: list[tuple[str, float]] = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            match = _DETECTION_LINE_RE.match(line.strip())
+            if not match:
+                continue
+            try:
+                rows.append((match.group("ts"), float(match.group("value"))))
+            except ValueError:
+                continue
+    return rows
 
 
 def _log_prediction_result(path: str, timestamp: str, prediction: dict, actual: float) -> None:
@@ -226,6 +270,7 @@ def run_detection(
     on_frame: "Callable[[object], None] | None" = None,
     system_prompt: str | None = None,
     model: str | None = None,
+    initial_history: "list[tuple[str, float]] | None" = None,
 ) -> None:
     """
     Run continuous detection from a window (by title substring) at target FPS.
@@ -251,8 +296,12 @@ def run_detection(
     """
     frame_interval = 1.0 / fps
     last_detected = None
-    history: list[float] = []
-    history_timestamps: list[str] = []
+    # initial_history seeds the context sent to the predictor with rounds from
+    # an earlier session (see load_detections), so a fresh run doesn't have to
+    # rebuild a usable sample from zero. Kept as two parallel lists because
+    # predict_next() zips them and requires equal lengths.
+    history: list[float] = [value for _, value in (initial_history or [])]
+    history_timestamps: list[str] = [ts for ts, _ in (initial_history or [])]
     pending_prediction: dict | None = None
     # predict_next() is a live, synchronous LLM API call that can take several
     # seconds. It's run on a background thread (below) so it never stalls the
@@ -274,9 +323,14 @@ def run_detection(
         request_id: int,
     ) -> None:
         nonlocal pending_prediction
-        prediction = predictor.predict_next(
+        result = predictor.predict_next(
             history_snapshot, timestamps=timestamps_snapshot, system_prompt=system_prompt, model=model
-        )
+        ) or {}
+        # A result carrying "error" is a failure report, not a prediction: it
+        # must reach the GUI so the user can see why there's no estimate, but
+        # it must not be logged as a prediction to score against the outcome.
+        error = result.get("error")
+        prediction = None if error else (result or None)
         with prediction_lock:
             if request_id != prediction_request_id:
                 print(f"Prediction for {timestamp} superseded by a newer round; discarding.")
@@ -289,16 +343,24 @@ def run_detection(
             )
         if on_update:
             on_update({
+                # kind="prediction" tells the GUI this update only carries the
+                # prediction fields. It still names its round via timestamp, so
+                # a reply that arrives after a newer round can be discarded
+                # rather than repainting that older round's multiplier.
+                "kind": "prediction",
                 "timestamp": timestamp,
                 "detected": actual_value,
                 "predicted_multiplier": (prediction or {}).get("predicted_multiplier"),
                 "confidence": (prediction or {}).get("confidence"),
                 "reasoning": (prediction or {}).get("reasoning"),
+                "error": error,
+                "error_detail": result.get("error_detail"),
             })
 
-    # We maintain a small memory so we don't log the same 'FLEW AWAY' multiple times for the same round
-    # We clear it if we go a few frames without seeing any multiplier.
-    empty_frames_count = 0
+    # We maintain a small memory so we don't log the same 'FLEW AWAY' multiple
+    # times for the same round. It's cleared once the multiplier has been gone
+    # from the screen for ROUND_RESET_SEC, which marks the round boundary.
+    last_multiplier_seen_at: float | None = None
 
     print(f"Starting detection on window containing '{window_title}'...")
     try:
@@ -337,9 +399,9 @@ def run_detection(
             multiplier = ocr.detect_multiplier(img)
             
             if multiplier:
-                empty_frames_count = 0
+                last_multiplier_seen_at = time.monotonic()
                 if multiplier != last_detected:
-                    timestamp = datetime.now().isoformat()
+                    timestamp = datetime.now().strftime(DETECTION_TIME_FORMAT)
                     log_line = f"{timestamp} - Detected Multiplier: {multiplier}\n"
                     print(log_line.strip())
                     try:
@@ -358,12 +420,22 @@ def run_detection(
                         history.append(actual_value)
                         history_timestamps.append(timestamp)
 
+                        # Allocate the new request id *before* announcing this
+                        # round, so any still-pending older prediction is
+                        # already marked cancelled. Doing it after left a window
+                        # in which an older reply passed the id check and
+                        # repainted the previous round over this one.
+                        with prediction_lock:
+                            prediction_request_id += 1
+                            request_id = prediction_request_id
+
                         # Fire the detection update immediately, before kicking
                         # off the (slow, network-bound) prediction - the GUI's
                         # "Last detected" label shouldn't wait on that just
                         # because it shares an update dict with "Next prediction".
                         if on_update:
                             on_update({
+                                "kind": "detection",
                                 "timestamp": timestamp,
                                 "detected": actual_value,
                                 "predicted_multiplier": None,
@@ -372,11 +444,6 @@ def run_detection(
 
                         # Run the prediction on a background thread so a slow
                         # (or hung) API call never stalls frame capture/OCR.
-                        # Allocate a new request id so any still-pending older
-                        # request gets discarded as cancelled when it returns.
-                        with prediction_lock:
-                            prediction_request_id += 1
-                            request_id = prediction_request_id
                         threading.Thread(
                             target=_predict_async,
                             args=(list(history), list(history_timestamps), timestamp, actual_value, request_id),
@@ -385,9 +452,18 @@ def run_detection(
 
                     last_detected = multiplier
             else:
-                empty_frames_count += 1
-                if empty_frames_count > fps * 3:  # 3 seconds without multiplier
+                # Measure the gap in wall-clock time, not frames. fps here is
+                # the *target* rate; the loop is OCR-bound and runs well below
+                # it, so a frame count against fps was really waiting tens of
+                # seconds - long enough that last_detected often survived into
+                # the next round and silently swallowed a repeated multiplier,
+                # leaving the GUI showing the previous round.
+                if (
+                    last_multiplier_seen_at is not None
+                    and time.monotonic() - last_multiplier_seen_at > ROUND_RESET_SEC
+                ):
                     last_detected = None
+                    last_multiplier_seen_at = None
 
     except KeyboardInterrupt:
         print("\nStopped.")

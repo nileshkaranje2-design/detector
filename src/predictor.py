@@ -68,6 +68,47 @@ DEFAULT_SYSTEM_PROMPT = (
 _client: openai.OpenAI | None = None
 
 
+def _error(short: str, detail: str) -> dict:
+    """Package a failure so callers can show it instead of a bare '-'."""
+    print(f"Predictor unavailable: {short} - {detail.splitlines()[0]}")
+    return {"error": short, "error_detail": detail}
+
+
+def _describe(e: openai.OpenAIError) -> dict:
+    """Turn an SDK exception into something a non-developer can act on."""
+    body = getattr(e, "body", None) or {}
+    code = body.get("code") or ""
+    status = getattr(e, "status_code", None)
+
+    if code == "credit_balance_exhausted" or body.get("type") == "insufficient_quota":
+        return _error(
+            "no API credits",
+            "The OpenAI account has no credits remaining.\n\n"
+            "Add credits at:\n"
+            "https://platform.openai.com/settings/organization/billing/\n\n"
+            "The key itself is valid - only billing is blocking predictions.",
+        )
+    if isinstance(e, openai.AuthenticationError) or status == 401:
+        return _error(
+            "API key rejected",
+            "The OpenAI API key was rejected (HTTP 401).\n\n"
+            "Check it with the 'Set API Key' button.",
+        )
+    if isinstance(e, openai.APIConnectionError):
+        return _error(
+            "cannot reach API",
+            f"Could not reach the OpenAI API - check the network connection.\n\n{e}",
+        )
+    if isinstance(e, openai.NotFoundError) or status == 404:
+        return _error(
+            "unknown model",
+            f"The selected model was not found, or this account cannot use it.\n\n{e}",
+        )
+    if isinstance(e, openai.RateLimitError) or status == 429:
+        return _error("rate limited", f"The API is rate limiting requests.\n\n{e}")
+    return _error(f"API error{f' ({status})' if status else ''}", str(e))
+
+
 def _get_client() -> openai.OpenAI:
     global _client
     if _client is None:
@@ -110,13 +151,22 @@ def predict_next(
     editable prompt box), letting the instructions be tuned without a code change.
     model overrides DEFAULT_MODEL when given (e.g. from the GUI's model dropdown).
 
-    Returns a dict with predicted_multiplier/confidence/reasoning, or None
-    (after printing a warning) if the API key is missing or the call fails -
-    prediction errors must never block the capture loop.
+    Returns one of:
+      - a dict with predicted_multiplier/confidence/reasoning, on success;
+      - a dict with "error" (a short reason, for the GUI's prediction line) and
+        "error_detail" (the full text, for the response pane), if the key is
+        missing or the call fails;
+      - None if there is nothing to predict yet (no history).
+
+    Failures are always reported this way rather than raised - a prediction
+    error must never block the capture loop - but the reason is carried back
+    instead of discarded, so the GUI can say why it has no prediction.
     """
     if not os.environ.get("OPENAI_API_KEY"):
-        print("Predictor: OPENAI_API_KEY not set - set it via the GUI's 'Set API Key' button, skipping prediction.")
-        return None
+        return _error(
+            "no API key set",
+            "No OpenAI API key is set.\n\nUse the 'Set API Key' button to add one.",
+        )
     if not history:
         return None
 
@@ -148,13 +198,15 @@ def predict_next(
             },
         )
     except openai.OpenAIError as e:
-        print(f"Predictor: API call failed: {e}")
-        return None
+        return _describe(e)
 
     text = response.choices[0].message.content if response.choices else None
     if not text:
-        return None
+        return _error("empty response", "The model returned an empty response.")
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return None
+        return _error(
+            "unreadable response",
+            f"The model's reply was not valid JSON:\n\n{text[:500]}",
+        )
